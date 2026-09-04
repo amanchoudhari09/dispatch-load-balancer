@@ -1,15 +1,49 @@
 package com.example.dispatch.exception;
 
-import org.springframework.http.*;
+import com.example.dispatch.exception.DispatchExceptions.DuplicateResourceException;
+import com.example.dispatch.exception.DispatchExceptions.InvalidDispatchStateException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
 import java.time.Instant;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
- record ErrorResponse(String status,String code,String message,Instant timestamp) {}
- @ExceptionHandler(MethodArgumentNotValidException.class) ResponseEntity<ErrorResponse> validation(MethodArgumentNotValidException e){String m=e.getBindingResult().getFieldErrors().stream().findFirst().map(x->x.getField()+": "+x.getDefaultMessage()).orElse("Invalid request");return response(HttpStatus.BAD_REQUEST,"INVALID_REQUEST",m);}
- @ExceptionHandler({IllegalArgumentException.class,IllegalStateException.class}) ResponseEntity<ErrorResponse> bad(RuntimeException e){return response(e instanceof IllegalStateException?HttpStatus.NOT_FOUND:HttpStatus.CONFLICT,"INVALID_STATE",e.getMessage());}
- @ExceptionHandler(Exception.class) ResponseEntity<ErrorResponse> unexpected(Exception e){return response(HttpStatus.INTERNAL_SERVER_ERROR,"INTERNAL_ERROR","Unexpected server error");}
- private ResponseEntity<ErrorResponse> response(HttpStatus s,String c,String m){return ResponseEntity.status(s).body(new ErrorResponse("error",c,m,Instant.now()));}
+    public record ErrorResponse(String status, String code, String message, Instant timestamp) { }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ErrorResponse> validation(MethodArgumentNotValidException exception) {
+        String message = exception.getBindingResult().getFieldErrors().stream()
+                .findFirst()
+                .map(this::formatFieldError)
+                .orElse("Request validation failed");
+        return response(HttpStatus.BAD_REQUEST, "INVALID_REQUEST", message);
+    }
+
+    @ExceptionHandler(DuplicateResourceException.class)
+    public ResponseEntity<ErrorResponse> duplicate(DuplicateResourceException exception) {
+        return response(HttpStatus.CONFLICT, "DUPLICATE_RESOURCE", exception.getMessage());
+    }
+
+    @ExceptionHandler(InvalidDispatchStateException.class)
+    public ResponseEntity<ErrorResponse> invalidState(InvalidDispatchStateException exception) {
+        return response(HttpStatus.NOT_FOUND, "DISPATCH_STATE_NOT_FOUND", exception.getMessage());
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> unexpected(Exception exception) {
+        return response(HttpStatus.INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", "Unexpected server error");
+    }
+
+    private String formatFieldError(FieldError error) {
+        return error.getField() + ": " + error.getDefaultMessage();
+    }
+
+    private ResponseEntity<ErrorResponse> response(HttpStatus status, String code, String message) {
+        return ResponseEntity.status(status).body(new ErrorResponse("error", code, message, Instant.now()));
+    }
 }
