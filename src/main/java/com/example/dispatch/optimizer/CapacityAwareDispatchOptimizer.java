@@ -1,20 +1,128 @@
 package com.example.dispatch.optimizer;
 
-import com.example.dispatch.domain.Models.*;
+import com.example.dispatch.domain.Models.DispatchPlan;
+import com.example.dispatch.domain.Models.DispatchResult;
+import com.example.dispatch.domain.Models.Order;
+import com.example.dispatch.domain.Models.Vehicle;
 import com.example.dispatch.distance.DistanceCalculator;
 import org.springframework.stereotype.Component;
-import java.util.*;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 
 @Component
-public class CapacityAwareDispatchOptimizer {
-    private final DistanceCalculator distance;
-    public CapacityAwareDispatchOptimizer(DistanceCalculator distance){this.distance=distance;}
-    public DispatchResult optimize(List<Order> input,List<Vehicle> vehicles){
-        List<Order> orders=new ArrayList<>(input); orders.sort(Comparator.comparing(Order::priority).thenComparing(Order::orderId));
-        Map<String,State> states=new LinkedHashMap<>(); vehicles.stream().sorted(Comparator.comparing(Vehicle::vehicleId)).forEach(v->states.put(v.vehicleId(),new State(v,distance)));
-        List<Order> unassigned=new ArrayList<>();
-        for(Order o:orders){State best=null; double cost=Double.POSITIVE_INFINITY; for(State s:states.values()) if(s.remaining()>=o.packageWeight()){double c=s.incremental(o,distance); if(c<cost-1e-9){cost=c;best=s;}} if(best==null) unassigned.add(o); else best.add(o);}
-        return new DispatchResult(states.values().stream().map(State::plan).toList(),unassigned);
+public class CapacityAwareDispatchOptimizer implements DispatchOptimizer {
+    private static final double EPSILON = 1.0e-9;
+    private final DistanceCalculator distanceCalculator;
+
+    public CapacityAwareDispatchOptimizer(DistanceCalculator distanceCalculator) {
+        this.distanceCalculator = distanceCalculator;
     }
-    private static final class State {final Vehicle v; final DistanceCalculator distance; final List<Order> route=new ArrayList<>(); double load,dist; State(Vehicle v,DistanceCalculator distance){this.v=v;this.distance=distance;} double remaining(){return v.capacity()-load;} double incremental(Order o,DistanceCalculator d){if(route.isEmpty())return d.calculateDistance(v.currentLatitude(),v.currentLongitude(),o.latitude(),o.longitude()); Order last=route.get(route.size()-1); return d.calculateDistance(last.latitude(),last.longitude(),o.latitude(),o.longitude());} void add(Order o){dist+=incremental(o,distance);load+=o.packageWeight();route.add(o);} DispatchPlan plan(){return new DispatchPlan(v.vehicleId(),v.capacity(),load,dist,route);}}
+
+    @Override
+    public DispatchResult optimize(List<Order> inputOrders, List<Vehicle> inputVehicles) {
+        List<Order> orders = new ArrayList<>(inputOrders);
+        orders.sort(Comparator.comparing(Order::priority).thenComparing(Order::orderId));
+        Map<String, VehicleState> states = new LinkedHashMap<>();
+        inputVehicles.stream().sorted(Comparator.comparing(Vehicle::vehicleId))
+                .forEach(vehicle -> states.put(vehicle.vehicleId(), new VehicleState(vehicle)));
+
+        List<Order> unassigned = new ArrayList<>();
+        for (Order order : orders) {
+            VehicleState best = null;
+            double bestDistance = Double.POSITIVE_INFINITY;
+            for (VehicleState candidate : states.values()) {
+                if (candidate.remainingCapacity() + EPSILON < order.packageWeight()) continue;
+                double candidateDistance = candidate.incrementalDistance(order);
+                if (best == null || isPreferred(candidate, candidateDistance, best, bestDistance)) {
+                    best = candidate;
+                    bestDistance = candidateDistance;
+                }
+            }
+            if (best == null) unassigned.add(order);
+            else best.assign(order);
+        }
+
+        states.values().forEach(VehicleState::improveRoute);
+        return new DispatchResult(states.values().stream().map(VehicleState::toPlan).toList(), unassigned);
+    }
+
+    private boolean isPreferred(VehicleState candidate, double candidateDistance,
+                                VehicleState current, double currentDistance) {
+        if (candidateDistance < currentDistance - EPSILON) return true;
+        if (Math.abs(candidateDistance - currentDistance) > EPSILON) return false;
+        if (candidate.remainingCapacity() > current.remainingCapacity() + EPSILON) return true;
+        return Math.abs(candidate.remainingCapacity() - current.remainingCapacity()) <= EPSILON
+                && candidate.vehicle.vehicleId().compareTo(current.vehicle.vehicleId()) < 0;
+    }
+
+    private final class VehicleState {
+        private final Vehicle vehicle;
+        private final List<Order> route = new ArrayList<>();
+        private double load;
+
+        private VehicleState(Vehicle vehicle) { this.vehicle = vehicle; }
+        private double remainingCapacity() { return vehicle.capacity() - load; }
+
+        private double incrementalDistance(Order order) {
+            if (route.isEmpty()) {
+                return distanceCalculator.calculateDistance(vehicle.currentLatitude(), vehicle.currentLongitude(),
+                        order.latitude(), order.longitude());
+            }
+            Order last = route.get(route.size() - 1);
+            return distanceCalculator.calculateDistance(last.latitude(), last.longitude(),
+                    order.latitude(), order.longitude());
+        }
+
+        private void assign(Order order) {
+            route.add(order);
+            load += order.packageWeight();
+        }
+
+        // 2-opt is a deterministic local-search heuristic. It changes route order only,
+        // so assignments and capacity remain unchanged; it does not guarantee global optimality.
+        private void improveRoute() {
+            boolean improved = true;
+            while (improved) {
+                improved = false;
+                double currentDistance = totalDistance();
+                for (int start = 0; start < route.size() - 1 && !improved; start++) {
+                    for (int end = start + 1; end < route.size(); end++) {
+                        List<Order> candidate = new ArrayList<>(route);
+                        java.util.Collections.reverse(candidate.subList(start, end + 1));
+                        double candidateDistance = totalDistance(candidate);
+                        if (candidateDistance < currentDistance - EPSILON) {
+                            route.clear();
+                            route.addAll(candidate);
+                            improved = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        private DispatchPlan toPlan() {
+            return new DispatchPlan(vehicle.vehicleId(), vehicle.capacity(), vehicle.currentLatitude(),
+                    vehicle.currentLongitude(), vehicle.currentAddress(), load, totalDistance(), route);
+        }
+
+        private double totalDistance() { return totalDistance(route); }
+
+        private double totalDistance(List<Order> routeToMeasure) {
+            double total = 0.0;
+            double previousLatitude = vehicle.currentLatitude();
+            double previousLongitude = vehicle.currentLongitude();
+            for (Order order : routeToMeasure) {
+                total += distanceCalculator.calculateDistance(previousLatitude, previousLongitude,
+                        order.latitude(), order.longitude());
+                previousLatitude = order.latitude();
+                previousLongitude = order.longitude();
+            }
+            return total;
+        }
+    }
 }
