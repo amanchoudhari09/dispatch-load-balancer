@@ -1,4 +1,4 @@
-# Dispatch Load Balancer
+# Dispatch Load Balance
 
 Backend-only Spring Boot 3 REST API for capacity-aware delivery dispatching.
 
